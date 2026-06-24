@@ -1,24 +1,30 @@
 import asyncio
 
+import os
+
 import aiosqlite
 
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, types, F
 
+from aiogram.filters import Command
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from aiogram.filters import Command
+from aiogram.fsm.state import StatesGroup, State
+
+from aiogram.fsm.context import FSMContext
+
+from aiogram.fsm.storage.memory import MemoryStorage
 
 TOKEN = "8992460588:AAG8hv3Q3Lfm0lRW43SL9amI6HKfVT1Kx7A"
 
 ADMINS = [2053617850]
 
-ADMINS = [89299392789]
-
 bot = Bot(token=TOKEN)
 
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 DB = "clan.db"
 
@@ -104,6 +110,16 @@ async def init_db():
 
         await db.commit()
 
+# ================= FSM =================
+
+class JoinState(StatesGroup):
+
+    nickname = State()
+
+    pubg_id = State()
+
+    rank = State()
+
 # ================= UI =================
 
 def menu():
@@ -112,13 +128,11 @@ def menu():
 
         [InlineKeyboardButton(text="👥 Состав", callback_data="players")],
 
-        [InlineKeyboardButton(text="📥 Заявки", callback_data="apps")],
-
         [InlineKeyboardButton(text="⚔️ КВ", callback_data="cw")],
 
         [InlineKeyboardButton(text="📊 Стата", callback_data="stats")],
 
-        [InlineKeyboardButton(text="💰 UC Магазин", callback_data="shop")]
+        [InlineKeyboardButton(text="💰 UC", callback_data="shop")]
 
     ])
 
@@ -130,107 +144,83 @@ async def start(msg: types.Message):
 
     await msg.answer("🔥 2PIK BOT", reply_markup=menu())
 
-# ================= PLAYERS =================
-
-@dp.callback_query(F.data == "players")
-
-async def players(call: types.CallbackQuery):
-
-    async with aiosqlite.connect(DB) as db:
-
-        rows = await db.execute_fetchall("SELECT nickname, role FROM players")
-
-    text = "👥 Состав:\n\n"
-
-    for r in rows:
-
-        text += f"{r[0]} — {r[1]}\n"
-
-    await call.message.edit_text(text, reply_markup=menu())
-
-# ================= JOIN =================
-
-user_state = {}
+# ================= JOIN FSM =================
 
 @dp.message(Command("join"))
 
-async def join(msg: types.Message):
+async def join_start(msg: types.Message, state: FSMContext):
 
-    user_state[msg.from_user.id] = {}
+    await state.set_state(JoinState.nickname)
 
     await msg.answer("Введите ник:")
 
-@dp.message()
+@dp.message(JoinState.nickname)
 
-async def form(msg: types.Message):
+async def join_nick(msg: types.Message, state: FSMContext):
 
-    if msg.from_user.id not in user_state:
+    await state.update_data(nickname=msg.text)
 
-        return
+    await state.set_state(JoinState.pubg_id)
 
-    data = user_state[msg.from_user.id]
+    await msg.answer("PUBG ID:")
 
-    if "nickname" not in data:
+@dp.message(JoinState.pubg_id)
 
-        data["nickname"] = msg.text
+async def join_id(msg: types.Message, state: FSMContext):
 
-        await msg.answer("PUBG ID:")
+    await state.update_data(pubg_id=msg.text)
 
-        return
+    await state.set_state(JoinState.rank)
 
-    if "pubg_id" not in data:
+    await msg.answer("Ранг:")
 
-        data["pubg_id"] = msg.text
+@dp.message(JoinState.rank)
 
-        await msg.answer("Ранг:")
+async def join_finish(msg: types.Message, state: FSMContext):
 
-        return
+    data = await state.get_data()
 
-    if "rank" not in data:
+    async with aiosqlite.connect(DB) as db:
 
-        data["rank"] = msg.text
+        cursor = await db.execute(
 
-        async with aiosqlite.connect(DB) as db:
+            "INSERT INTO applications (tg_id, nickname, pubg_id, rank, status) VALUES (?, ?, ?, ?, ?)",
 
-            cursor = await db.execute(
+            (msg.from_user.id, data["nickname"], data["pubg_id"], msg.text, "pending")
 
-                "INSERT INTO applications (tg_id, nickname, pubg_id, rank, status) VALUES (?, ?, ?, ?, ?)",
+        )
 
-                (msg.from_user.id, data["nickname"], data["pubg_id"], data["rank"], "pending")
+        app_id = cursor.lastrowid
 
-            )
+        await db.commit()
 
-            app_id = cursor.lastrowid
+    kb = InlineKeyboardMarkup(inline_keyboard=[
 
-            await db.commit()
+        [
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+            InlineKeyboardButton(text="✅", callback_data=f"accept_{app_id}"),
 
-            [
+            InlineKeyboardButton(text="❌", callback_data=f"reject_{app_id}")
 
-                InlineKeyboardButton(text="✅", callback_data=f"accept_{app_id}"),
+        ]
 
-                InlineKeyboardButton(text="❌", callback_data=f"reject_{app_id}")
+    ])
 
-            ]
+    for admin in ADMINS:
 
-        ])
+        await bot.send_message(
 
-        for admin in ADMINS:
+            admin,
 
-            await bot.send_message(
+            f"📥 {data['nickname']} ({msg.text})\nID: {data['pubg_id']}",
 
-                admin,
+            reply_markup=kb
 
-                f"📥 Заявка\n{data['nickname']} ({data['rank']})\nID: {data['pubg_id']}",
+        )
 
-                reply_markup=kb
+    await msg.answer("Заявка отправлена ✅")
 
-            )
-
-        await msg.answer("Заявка отправлена ✅")
-
-        del user_state[msg.from_user.id]
+    await state.clear()
 
 # ================= ACCEPT =================
 
@@ -302,6 +292,24 @@ async def reject(call: types.CallbackQuery):
 
     await call.message.edit_text("❌ Отклонено")
 
+# ================= PLAYERS =================
+
+@dp.callback_query(F.data == "players")
+
+async def players(call: types.CallbackQuery):
+
+    async with aiosqlite.connect(DB) as db:
+
+        rows = await db.execute_fetchall("SELECT nickname, role FROM players")
+
+    text = "👥 Состав:\n\n"
+
+    for r in rows:
+
+        text += f"{r[0]} — {r[1]}\n"
+
+    await call.message.edit_text(text, reply_markup=menu())
+
 # ================= CW =================
 
 @dp.callback_query(F.data == "cw")
@@ -320,8 +328,6 @@ async def cw(call: types.CallbackQuery):
 
     await call.message.edit_text(text, reply_markup=menu())
 
-# ================= ADD CW =================
-
 @dp.message(Command("add_cw"))
 
 async def add_cw(msg: types.Message):
@@ -334,37 +340,11 @@ async def add_cw(msg: types.Message):
 
     async with aiosqlite.connect(DB) as db:
 
-        await db.execute(
-
-            "INSERT INTO cw (enemy, time) VALUES (?, ?)",
-
-            (enemy, time)
-
-        )
+        await db.execute("INSERT INTO cw (enemy, time) VALUES (?, ?)", (enemy, time))
 
         await db.commit()
 
     await msg.answer("КВ добавлено ⚔️")
-
-# ================= ACTIVE =================
-
-@dp.message(Command("active"))
-
-async def active(msg: types.Message):
-
-    async with aiosqlite.connect(DB) as db:
-
-        await db.execute(
-
-            "UPDATE players SET last_active=? WHERE tg_id=?",
-
-            (str(datetime.now()), msg.from_user.id)
-
-        )
-
-        await db.commit()
-
-    await msg.answer("Актив ✅")
 
 # ================= STATS =================
 
@@ -388,25 +368,25 @@ async def stats(call: types.CallbackQuery):
 
     await call.message.edit_text(text, reply_markup=menu())
 
-# ================= WIN =================
+# ================= ACTIVE =================
 
-@dp.message(Command("win"))
+@dp.message(Command("active"))
 
-async def win(msg: types.Message):
+async def active(msg: types.Message):
 
     async with aiosqlite.connect(DB) as db:
 
         await db.execute(
 
-            "UPDATE players SET wins = wins + 1 WHERE tg_id=?",
+            "UPDATE players SET last_active=? WHERE tg_id=?",
 
-            (msg.from_user.id,)
+            (str(datetime.now()), msg.from_user.id)
 
         )
 
         await db.commit()
 
-    await msg.answer("Победа 🏆")
+    await msg.answer("Актив засчитан ✅")
 
 # ================= SHOP =================
 
@@ -414,13 +394,7 @@ async def win(msg: types.Message):
 
 async def shop(call: types.CallbackQuery):
 
-    await call.message.edit_text(
-
-        "💰 Напиши: /buy_uc 660\n",
-
-        reply_markup=menu()
-
-    )
+    await call.message.edit_text("💰 /buy_uc 660", reply_markup=menu())
 
 @dp.message(Command("buy_uc"))
 
@@ -440,7 +414,7 @@ async def buy(msg: types.Message):
 
         await db.commit()
 
-    await msg.answer("Заявка на UC отправлена 💰")
+    await msg.answer("Заявка отправлена 💰")
 
 # ================= RUN =================
 
@@ -450,4 +424,6 @@ async def main():
 
     await dp.start_polling(bot)
 
-asyncio.run(main())
+if __name__ == "__main__":
+
+    asyncio.run(main())
